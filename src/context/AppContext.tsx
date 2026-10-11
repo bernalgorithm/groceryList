@@ -1,15 +1,43 @@
-import React, { createContext, useContext, useEffect, useState, useMemo } from 'react';
+import React, { createContext, useContext, useEffect, useState, useMemo, useCallback } from 'react';
 import * as Haptics from 'expo-haptics';
-import { User, Friend, FriendRequest, GroceryList, GroceryItem, GroceryCategory } from '../types';
+import {
+  User,
+  Friend,
+  FriendRequest,
+  GroceryList,
+  GroceryItem,
+  GroceryCategory,
+  CloudSyncState,
+} from '../types';
 import {
   DEFAULT_USER,
   loadStorageData,
   saveStorageLists,
   saveStorageFriends,
   saveStorageFriendRequests,
+  saveStorageUser,
 } from '../storage/localStorage';
 import { sendInviteMessage } from '../utils/invites';
 import { autoDetectCategory } from '../utils/categories';
+import { isFirebaseConfigured, FirebaseUser } from '../config/firebase';
+import {
+  subscribeToAuth,
+  signInAnonymousUser,
+  signInWithEmail as cloudSignInWithEmail,
+  registerWithEmail as cloudRegisterWithEmail,
+  signOutCloudUser,
+} from '../services/cloudAuth';
+import {
+  subscribeToCloudLists,
+  saveCloudList,
+  deleteCloudList,
+  subscribeToCloudFriendRequests,
+  saveCloudFriendRequest,
+  updateCloudFriendRequestStatus,
+  subscribeToCloudFriends,
+  saveCloudFriend,
+  deleteCloudFriend,
+} from '../services/cloudSync';
 
 interface AppContextType {
   user: User;
@@ -18,6 +46,8 @@ interface AppContextType {
   friendRequests: FriendRequest[];
   pendingRequestsCount: number;
   isLoaded: boolean;
+  cloudSyncState: CloudSyncState;
+  cloudUser: FirebaseUser | null;
   createList: (data: {
     title: string;
     description?: string;
@@ -51,6 +81,10 @@ interface AppContextType {
   removeFriend: (friendId: string) => void;
   toggleListSharing: (listId: string, friend: Friend) => void;
   simulatePartnerActivity: (listId: string) => void;
+  signInWithEmail: (email: string, pass: string) => Promise<void>;
+  signUpWithEmail: (email: string, pass: string, name: string) => Promise<void>;
+  signInAnonymously: () => Promise<void>;
+  signOutCloud: () => Promise<void>;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -62,6 +96,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [friendRequests, setFriendRequests] = useState<FriendRequest[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
 
+  // Cloud Sync State
+  const [cloudUser, setCloudUser] = useState<FirebaseUser | null>(null);
+  const [cloudSyncState, setCloudSyncState] = useState<CloudSyncState>(() => ({
+    isConfigured: isFirebaseConfigured(),
+    status: isFirebaseConfigured() ? 'connecting' : 'offline-local',
+  }));
+
+  // Load local persistent storage first (instant 0ms startup)
   useEffect(() => {
     async function init() {
       const data = await loadStorageData();
@@ -73,6 +115,96 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
     init();
   }, []);
+
+  // Subscribe to Firebase Auth state if configured
+  useEffect(() => {
+    if (!isFirebaseConfigured()) return;
+
+    const unsubAuth = subscribeToAuth(fbUser => {
+      setCloudUser(fbUser);
+      if (fbUser) {
+        setCloudSyncState(prev => ({
+          ...prev,
+          status: 'synced',
+          lastSyncedAt: new Date().toLocaleTimeString(),
+        }));
+        // Update user ID and display name if provided by Firebase
+        if (fbUser.displayName || fbUser.email) {
+          setUser(prev => {
+            const updated = {
+              ...prev,
+              id: fbUser.uid,
+              name: fbUser.displayName || prev.name,
+              email: fbUser.email || prev.email,
+            };
+            saveStorageUser(updated);
+            return updated;
+          });
+        }
+      } else {
+        setCloudSyncState(prev => ({
+          ...prev,
+          status: 'offline-local',
+        }));
+      }
+    });
+
+    return () => unsubAuth();
+  }, []);
+
+  // Active Real-time Firestore Subscriptions for Lists, Friends, and Requests
+  useEffect(() => {
+    if (!isFirebaseConfigured() || !cloudUser) return;
+
+    // 1. Subscribe to Cloud Lists
+    const unsubLists = subscribeToCloudLists(
+      cloudUser.uid,
+      cloudLists => {
+        if (cloudLists.length > 0) {
+          setLists(cloudLists);
+          saveStorageLists(cloudLists);
+        }
+        setCloudSyncState(prev => ({
+          ...prev,
+          status: 'synced',
+          lastSyncedAt: new Date().toLocaleTimeString(),
+        }));
+      },
+      err => {
+        setCloudSyncState(prev => ({
+          ...prev,
+          status: 'error',
+          errorMessage: err.message,
+        }));
+      }
+    );
+
+    // 2. Subscribe to Cloud Friend Requests
+    const unsubReqs = subscribeToCloudFriendRequests(
+      cloudUser.uid,
+      user.email || user.phone,
+      cloudReqs => {
+        if (cloudReqs.length > 0) {
+          setFriendRequests(cloudReqs);
+          saveStorageFriendRequests(cloudReqs);
+        }
+      }
+    );
+
+    // 3. Subscribe to Cloud Friends
+    const unsubFriends = subscribeToCloudFriends(cloudUser.uid, cloudFrds => {
+      if (cloudFrds.length > 0) {
+        setFriends(cloudFrds);
+        saveStorageFriends(cloudFrds);
+      }
+    });
+
+    return () => {
+      unsubLists();
+      unsubReqs();
+      unsubFriends();
+    };
+  }, [cloudUser, user.email, user.phone]);
 
   const pendingRequestsCount = useMemo(
     () => friendRequests.filter(r => r.status === 'pending').length,
@@ -99,16 +231,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     isShared?: boolean;
     sharedWith?: Friend[];
   }) => {
+    const currentUserId = cloudUser ? cloudUser.uid : user.id;
+    const memberIds = [currentUserId];
+    if (data.sharedWith) {
+      data.sharedWith.forEach(f => {
+        if (f.userId) memberIds.push(f.userId);
+      });
+    }
+
     const newList: GroceryList = {
       id: `list_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       title: data.title,
       description: data.description,
       color: data.color || '#10b981',
       icon: data.icon || 'cart',
-      ownerId: user.id,
+      ownerId: currentUserId,
       ownerName: user.name,
       isShared: !!data.isShared,
       sharedWith: data.sharedWith || [],
+      memberIds,
       items: [],
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -117,19 +258,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const updated = [newList, ...lists];
     setLists(updated);
     saveStorageLists(updated);
+
+    // Sync to Cloud Firestore asynchronously
+    saveCloudList(newList).catch(err =>
+      console.warn('[CloudSync] Failed to save list to cloud:', err)
+    );
+
     return newList;
   };
 
   const updateList = (updatedList: GroceryList) => {
-    const updated = lists.map(l => (l.id === updatedList.id ? { ...updatedList, updatedAt: new Date().toISOString() } : l));
+    const listWithTimestamp = {
+      ...updatedList,
+      updatedAt: new Date().toISOString(),
+    };
+    const updated = lists.map(l => (l.id === updatedList.id ? listWithTimestamp : l));
     setLists(updated);
     saveStorageLists(updated);
+
+    saveCloudList(listWithTimestamp).catch(err =>
+      console.warn('[CloudSync] Failed to update list in cloud:', err)
+    );
   };
 
   const deleteList = (listId: string) => {
     const updated = lists.filter(l => l.id !== listId);
     setLists(updated);
     saveStorageLists(updated);
+
+    deleteCloudList(listId).catch(err =>
+      console.warn('[CloudSync] Failed to delete list from cloud:', err)
+    );
   };
 
   const addItem = (
@@ -152,18 +311,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       category: detectedCategory,
       notes: itemData.notes,
       isConcluded: false,
-      addedBy: user.id,
+      addedBy: cloudUser ? cloudUser.uid : user.id,
       addedByName: user.name.split(' ')[0],
       addedAt: new Date().toISOString(),
     };
 
+    let modifiedList: GroceryList | undefined;
+
     const updated = lists.map(l => {
       if (l.id === listId) {
-        return {
+        modifiedList = {
           ...l,
           updatedAt: new Date().toISOString(),
           items: [newItem, ...l.items],
         };
+        return modifiedList;
       }
       return l;
     });
@@ -171,59 +333,90 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setLists(updated);
     saveStorageLists(updated);
     triggerHaptic('light');
+
+    if (modifiedList) {
+      saveCloudList(modifiedList).catch(err =>
+        console.warn('[CloudSync] Failed to add item to cloud:', err)
+      );
+    }
   };
 
   const updateItem = (listId: string, updatedItem: GroceryItem) => {
+    let modifiedList: GroceryList | undefined;
+
     const updated = lists.map(l => {
       if (l.id === listId) {
-        return {
+        modifiedList = {
           ...l,
           updatedAt: new Date().toISOString(),
           items: l.items.map(it => (it.id === updatedItem.id ? updatedItem : it)),
         };
+        return modifiedList;
       }
       return l;
     });
+
     setLists(updated);
     saveStorageLists(updated);
+
+    if (modifiedList) {
+      saveCloudList(modifiedList).catch(err =>
+        console.warn('[CloudSync] Failed to update item in cloud:', err)
+      );
+    }
   };
 
   const deleteItem = (listId: string, itemId: string) => {
+    let modifiedList: GroceryList | undefined;
+
     const updated = lists.map(l => {
       if (l.id === listId) {
-        return {
+        modifiedList = {
           ...l,
           updatedAt: new Date().toISOString(),
           items: l.items.filter(it => it.id !== itemId),
         };
+        return modifiedList;
       }
       return l;
     });
+
     setLists(updated);
     saveStorageLists(updated);
     triggerHaptic('light');
+
+    if (modifiedList) {
+      saveCloudList(modifiedList).catch(err =>
+        console.warn('[CloudSync] Failed to delete item from cloud:', err)
+      );
+    }
   };
 
   const toggleConcludeItem = (listId: string, itemId: string) => {
     let nowConcluded = false;
+    let modifiedList: GroceryList | undefined;
+
     const updated = lists.map(l => {
       if (l.id === listId) {
-        return {
+        const updatedItems = l.items.map(it => {
+          if (it.id === itemId) {
+            nowConcluded = !it.isConcluded;
+            return {
+              ...it,
+              isConcluded: nowConcluded,
+              concludedBy: nowConcluded ? user.name.split(' ')[0] : undefined,
+              concludedAt: nowConcluded ? new Date().toISOString() : undefined,
+            };
+          }
+          return it;
+        });
+
+        modifiedList = {
           ...l,
           updatedAt: new Date().toISOString(),
-          items: l.items.map(it => {
-            if (it.id === itemId) {
-              nowConcluded = !it.isConcluded;
-              return {
-                ...it,
-                isConcluded: nowConcluded,
-                concludedBy: nowConcluded ? user.name.split(' ')[0] : undefined,
-                concludedAt: nowConcluded ? new Date().toISOString() : undefined,
-              };
-            }
-            return it;
-          }),
+          items: updatedItems,
         };
+        return modifiedList;
       }
       return l;
     });
@@ -236,21 +429,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     } else {
       triggerHaptic('light');
     }
+
+    if (modifiedList) {
+      saveCloudList(modifiedList).catch(err =>
+        console.warn('[CloudSync] Failed to toggle conclude item in cloud:', err)
+      );
+    }
   };
 
   const clearConcludedItems = (listId: string) => {
+    let modifiedList: GroceryList | undefined;
+
     const updated = lists.map(l => {
       if (l.id === listId) {
-        return {
+        modifiedList = {
           ...l,
           updatedAt: new Date().toISOString(),
           items: l.items.filter(it => !it.isConcluded),
         };
+        return modifiedList;
       }
       return l;
     });
+
     setLists(updated);
     saveStorageLists(updated);
+
+    if (modifiedList) {
+      saveCloudList(modifiedList).catch(err =>
+        console.warn('[CloudSync] Failed to clear concluded items in cloud:', err)
+      );
+    }
   };
 
   const sendFriendInvite = async (contact: string, relationship: Friend['relationship']) => {
@@ -259,10 +468,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       senderName: user.name,
     });
 
-    // Also register pending outgoing request locally
+    // Also register pending outgoing request
     const newRequest: FriendRequest = {
       id: `req_${Date.now()}`,
-      senderId: user.id,
+      senderId: cloudUser ? cloudUser.uid : user.id,
       senderName: user.name,
       senderContact: user.email,
       senderAvatarColor: user.avatarColor,
@@ -274,6 +483,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const updatedRequests = [newRequest, ...friendRequests];
     setFriendRequests(updatedRequests);
     saveStorageFriendRequests(updatedRequests);
+
+    saveCloudFriendRequest(newRequest).catch(err =>
+      console.warn('[CloudSync] Failed to save friend request in cloud:', err)
+    );
 
     return result;
   };
@@ -303,6 +516,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     saveStorageFriends(updatedFriends);
     saveStorageFriendRequests(updatedRequests);
     triggerHaptic('success');
+
+    updateCloudFriendRequestStatus(requestId, 'accepted').catch(err =>
+      console.warn('[CloudSync] Failed to accept friend request in cloud:', err)
+    );
+    if (cloudUser) {
+      saveCloudFriend(cloudUser.uid, newFriend).catch(err =>
+        console.warn('[CloudSync] Failed to save friend in cloud:', err)
+      );
+    }
   };
 
   const rejectFriendRequest = (requestId: string) => {
@@ -311,6 +533,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     );
     setFriendRequests(updatedRequests);
     saveStorageFriendRequests(updatedRequests);
+
+    updateCloudFriendRequestStatus(requestId, 'rejected').catch(err =>
+      console.warn('[CloudSync] Failed to reject friend request in cloud:', err)
+    );
   };
 
   const removeFriend = (friendId: string) => {
@@ -318,35 +544,88 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setFriends(updatedFriends);
     saveStorageFriends(updatedFriends);
 
+    if (cloudUser) {
+      deleteCloudFriend(cloudUser.uid, friendId).catch(err =>
+        console.warn('[CloudSync] Failed to delete friend from cloud:', err)
+      );
+    }
+
     // Also remove from any shared lists
-    const updatedLists = lists.map(l => ({
-      ...l,
-      sharedWith: l.sharedWith.filter(f => f.id !== friendId),
-      isShared: l.sharedWith.filter(f => f.id !== friendId).length > 0,
-    }));
+    const updatedLists = lists.map(l => {
+      const updatedShared = l.sharedWith.filter(f => f.id !== friendId);
+      const updatedMembers = [l.ownerId, ...updatedShared.map(f => f.userId)];
+      const updatedList = {
+        ...l,
+        sharedWith: updatedShared,
+        memberIds: updatedMembers,
+        isShared: updatedShared.length > 0,
+      };
+      if (l.sharedWith.some(f => f.id === friendId)) {
+        saveCloudList(updatedList).catch(err =>
+          console.warn('[CloudSync] Failed to update list members in cloud:', err)
+        );
+      }
+      return updatedList;
+    });
     setLists(updatedLists);
     saveStorageLists(updatedLists);
   };
 
   const toggleListSharing = (listId: string, friend: Friend) => {
+    let modifiedList: GroceryList | undefined;
+
     const updated = lists.map(l => {
       if (l.id === listId) {
         const isAlreadyShared = l.sharedWith.some(f => f.id === friend.id);
         const updatedShared = isAlreadyShared
           ? l.sharedWith.filter(f => f.id !== friend.id)
           : [...l.sharedWith, friend];
-        return {
+        const updatedMembers = [l.ownerId, ...updatedShared.map(f => f.userId)];
+
+        modifiedList = {
           ...l,
           isShared: updatedShared.length > 0,
           sharedWith: updatedShared,
+          memberIds: updatedMembers,
           updatedAt: new Date().toISOString(),
         };
+        return modifiedList;
       }
       return l;
     });
+
     setLists(updated);
     saveStorageLists(updated);
+
+    if (modifiedList) {
+      saveCloudList(modifiedList).catch(err =>
+        console.warn('[CloudSync] Failed to update list sharing in cloud:', err)
+      );
+    }
   };
+
+  // Auth actions
+  const signInWithEmail = useCallback(async (email: string, pass: string) => {
+    await cloudSignInWithEmail(email, pass);
+  }, []);
+
+  const signUpWithEmail = useCallback(async (email: string, pass: string, name: string) => {
+    await cloudRegisterWithEmail(email, pass);
+    setUser(prev => {
+      const updated = { ...prev, name, email };
+      saveStorageUser(updated);
+      return updated;
+    });
+  }, []);
+
+  const signInAnonymously = useCallback(async () => {
+    await signInAnonymousUser();
+  }, []);
+
+  const signOutCloud = useCallback(async () => {
+    await signOutCloudUser();
+    setCloudUser(null);
+  }, []);
 
   // Simulated collaboration activity to demonstrate real-time sync when testing with family/partner
   const simulatePartnerActivity = (listId: string) => {
@@ -373,13 +652,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       addedAt: new Date().toISOString(),
     };
 
+    let modifiedList: GroceryList | undefined;
+
     const updated = lists.map(l => {
       if (l.id === listId) {
-        return {
+        modifiedList = {
           ...l,
           updatedAt: new Date().toISOString(),
           items: [newItem, ...l.items],
         };
+        return modifiedList;
       }
       return l;
     });
@@ -387,6 +669,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setLists(updated);
     saveStorageLists(updated);
     triggerHaptic('light');
+
+    if (modifiedList) {
+      saveCloudList(modifiedList).catch(err =>
+        console.warn('[CloudSync] Failed to simulate partner activity in cloud:', err)
+      );
+    }
   };
 
   return (
@@ -398,6 +686,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         friendRequests,
         pendingRequestsCount,
         isLoaded,
+        cloudSyncState,
+        cloudUser,
         createList,
         updateList,
         deleteList,
@@ -412,6 +702,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         removeFriend,
         toggleListSharing,
         simulatePartnerActivity,
+        signInWithEmail,
+        signUpWithEmail,
+        signInAnonymously,
+        signOutCloud,
       }}
     >
       {children}

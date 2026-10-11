@@ -12,34 +12,77 @@ import { Ionicons } from '@expo/vector-icons';
 import { useApp } from '../context/AppContext';
 import { GroceryList } from '../types';
 import { CreateListModal } from '../components/CreateListModal';
+import { CloudSyncModal } from '../components/CloudSyncModal';
 
 type FilterType = 'all' | 'shared' | 'personal';
 
 export default function HomeScreen() {
-  const { lists, pendingRequestsCount } = useApp();
+  const { lists, pendingRequestsCount, cloudSyncState } = useApp();
   const [filter, setFilter] = useState<FilterType>('all');
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showCloudModal, setShowCloudModal] = useState(false);
   const navigation = useNavigation();
 
-  // Set up header right button with pending friend request badge
+  // Set up header right buttons with Cloud Sync status and pending friend request badge
   React.useLayoutEffect(() => {
     navigation.setOptions({
       headerRight: () => (
-        <TouchableOpacity
-          onPress={() => router.push('/friends')}
-          style={styles.friendsHeaderBtn}
-          activeOpacity={0.7}
-        >
-          <Ionicons name="people-outline" size={24} color="#0f172a" />
-          {pendingRequestsCount > 0 && (
-            <View style={styles.badge}>
-              <Text style={styles.badgeText}>{pendingRequestsCount}</Text>
-            </View>
-          )}
-        </TouchableOpacity>
+        <View style={styles.headerRightContainer}>
+          <TouchableOpacity
+            onPress={() => setShowCloudModal(true)}
+            style={styles.cloudHeaderBtn}
+            activeOpacity={0.7}
+            accessibilityLabel="Cloud Sync status"
+          >
+            <Ionicons
+              name={
+                cloudSyncState.status === 'synced'
+                  ? 'cloud-done'
+                  : cloudSyncState.status === 'connecting'
+                  ? 'cloud-upload'
+                  : 'cloud-offline-outline'
+              }
+              size={22}
+              color={
+                cloudSyncState.status === 'synced'
+                  ? '#10b981'
+                  : cloudSyncState.status === 'connecting'
+                  ? '#f59e0b'
+                  : '#64748b'
+              }
+            />
+            <View
+              style={[
+                styles.cloudDot,
+                {
+                  backgroundColor:
+                    cloudSyncState.status === 'synced'
+                      ? '#10b981'
+                      : cloudSyncState.status === 'connecting'
+                      ? '#f59e0b'
+                      : '#94a3b8',
+                },
+              ]}
+            />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={() => router.push('/friends')}
+            style={styles.friendsHeaderBtn}
+            activeOpacity={0.7}
+            accessibilityLabel="Friends & family"
+          >
+            <Ionicons name="people-outline" size={24} color="#0f172a" />
+            {pendingRequestsCount > 0 && (
+              <View style={styles.badge}>
+                <Text style={styles.badgeText}>{pendingRequestsCount}</Text>
+              </View>
+            )}
+          </TouchableOpacity>
+        </View>
       ),
     });
-  }, [navigation, pendingRequestsCount]);
+  }, [navigation, pendingRequestsCount, cloudSyncState.status]);
 
   const filteredLists = lists.filter(l => {
     if (filter === 'shared') return l.isShared;
@@ -226,6 +269,12 @@ export default function HomeScreen() {
         onClose={() => setShowCreateModal(false)}
         onListCreated={listId => router.push(`/list/${listId}`)}
       />
+
+      {/* Cloud Sync Status & Auth Modal */}
+      <CloudSyncModal
+        visible={showCloudModal}
+        onClose={() => setShowCloudModal(false)}
+      />
     </SafeAreaView>
   );
 }
@@ -235,8 +284,30 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#f8fafc',
   },
+  headerRightContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginRight: 4,
+  },
+  cloudHeaderBtn: {
+    padding: 8,
+    position: 'relative',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  cloudDot: {
+    position: 'absolute',
+    bottom: 6,
+    right: 6,
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: '#ffffff',
+  },
   friendsHeaderBtn: {
-    paddingHorizontal: 12,
+    paddingHorizontal: 10,
     paddingVertical: 6,
     position: 'relative',
   },

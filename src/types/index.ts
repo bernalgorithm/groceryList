@@ -68,7 +68,17 @@ export interface GroceryList {
   ownerName: string;
   isShared: boolean;
   sharedWith: Friend[];
+  memberIds?: string[];
   items: GroceryItem[];
   createdAt: string;
   updatedAt: string;
+}
+
+export type CloudSyncStatus = 'offline-local' | 'connecting' | 'synced' | 'error';
+
+export interface CloudSyncState {
+  isConfigured: boolean;
+  status: CloudSyncStatus;
+  lastSyncedAt?: string;
+  errorMessage?: string;
 }
