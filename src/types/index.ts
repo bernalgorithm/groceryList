@@ -6,6 +6,7 @@ export interface User {
   email: string;
   phone: string;
   avatarColor: string;
+  familyCode?: string;
 }
 
 export interface Friend {
@@ -69,6 +70,7 @@ export interface GroceryList {
   isShared: boolean;
   sharedWith: Friend[];
   memberIds?: string[];
+  familyCode?: string;
   items: GroceryItem[];
   createdAt: string;
   updatedAt: string;

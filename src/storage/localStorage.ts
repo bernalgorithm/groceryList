@@ -6,6 +6,7 @@ const STORAGE_KEYS = {
   LISTS: '@grocery_app_lists',
   FRIENDS: '@grocery_app_friends',
   FRIEND_REQUESTS: '@grocery_app_friend_requests',
+  FAMILY_CODE: '@grocery_app_family_code',
 };
 
 export const DEFAULT_USER: User = {
@@ -188,21 +189,26 @@ const SEED_LISTS: GroceryList[] = [
 
 export async function loadStorageData() {
   try {
-    const [storedUser, storedLists, storedFriends, storedRequests] = await Promise.all([
-      AsyncStorage.getItem(STORAGE_KEYS.USER),
-      AsyncStorage.getItem(STORAGE_KEYS.LISTS),
-      AsyncStorage.getItem(STORAGE_KEYS.FRIENDS),
-      AsyncStorage.getItem(STORAGE_KEYS.FRIEND_REQUESTS),
-    ]);
+    const [storedUser, storedLists, storedFriends, storedRequests, storedFamilyCode] =
+      await Promise.all([
+        AsyncStorage.getItem(STORAGE_KEYS.USER),
+        AsyncStorage.getItem(STORAGE_KEYS.LISTS),
+        AsyncStorage.getItem(STORAGE_KEYS.FRIENDS),
+        AsyncStorage.getItem(STORAGE_KEYS.FRIEND_REQUESTS),
+        AsyncStorage.getItem(STORAGE_KEYS.FAMILY_CODE),
+      ]);
 
     const user: User = storedUser ? JSON.parse(storedUser) : DEFAULT_USER;
+    if (storedFamilyCode) {
+      user.familyCode = storedFamilyCode;
+    }
     const lists: GroceryList[] = storedLists ? JSON.parse(storedLists) : SEED_LISTS;
     const friends: Friend[] = storedFriends ? JSON.parse(storedFriends) : SEED_FRIENDS;
     const friendRequests: FriendRequest[] = storedRequests
       ? JSON.parse(storedRequests)
       : SEED_FRIEND_REQUESTS;
 
-    return { user, lists, friends, friendRequests };
+    return { user, lists, friends, friendRequests, familyCode: storedFamilyCode || undefined };
   } catch (err) {
     console.error('Failed to load storage data:', err);
     return {
@@ -210,6 +216,7 @@ export async function loadStorageData() {
       lists: SEED_LISTS,
       friends: SEED_FRIENDS,
       friendRequests: SEED_FRIEND_REQUESTS,
+      familyCode: undefined,
     };
   }
 }
@@ -243,5 +250,17 @@ export async function saveStorageUser(user: User) {
     await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(user));
   } catch (err) {
     console.error('Failed to save user:', err);
+  }
+}
+
+export async function saveStorageFamilyCode(code?: string) {
+  try {
+    if (code) {
+      await AsyncStorage.setItem(STORAGE_KEYS.FAMILY_CODE, code);
+    } else {
+      await AsyncStorage.removeItem(STORAGE_KEYS.FAMILY_CODE);
+    }
+  } catch (err) {
+    console.error('Failed to save family code:', err);
   }
 }

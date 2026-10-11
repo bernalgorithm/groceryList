@@ -16,6 +16,7 @@ import {
   saveStorageFriends,
   saveStorageFriendRequests,
   saveStorageUser,
+  saveStorageFamilyCode,
 } from '../storage/localStorage';
 import { sendInviteMessage } from '../utils/invites';
 import { autoDetectCategory } from '../utils/categories';
@@ -29,6 +30,8 @@ import {
 } from '../services/cloudAuth';
 import {
   subscribeToCloudLists,
+  subscribeToFamilyLists,
+  registerFamilyRoom,
   saveCloudList,
   deleteCloudList,
   subscribeToCloudFriendRequests,
@@ -48,6 +51,7 @@ interface AppContextType {
   isLoaded: boolean;
   cloudSyncState: CloudSyncState;
   cloudUser: FirebaseUser | null;
+  familyCode?: string;
   createList: (data: {
     title: string;
     description?: string;
@@ -85,6 +89,9 @@ interface AppContextType {
   signUpWithEmail: (email: string, pass: string, name: string) => Promise<void>;
   signInAnonymously: () => Promise<void>;
   signOutCloud: () => Promise<void>;
+  pairWithFamilyCode: (code: string) => Promise<void>;
+  generateNewFamilyCode: () => string;
+  unpairFamily: () => Promise<void>;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -120,7 +127,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   useEffect(() => {
     if (!isFirebaseConfigured()) return;
 
-    const unsubAuth = subscribeToAuth(fbUser => {
+    const unsubAuth = subscribeToAuth(async fbUser => {
       setCloudUser(fbUser);
       if (fbUser) {
         setCloudSyncState(prev => ({
@@ -128,7 +135,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           status: 'synced',
           lastSyncedAt: new Date().toLocaleTimeString(),
         }));
-        // Update user ID and display name if provided by Firebase
         if (fbUser.displayName || fbUser.email) {
           setUser(prev => {
             const updated = {
@@ -142,17 +148,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           });
         }
       } else {
-        setCloudSyncState(prev => ({
-          ...prev,
-          status: 'offline-local',
-        }));
+        // Automatically start anonymous session for frictionless use
+        try {
+          await signInAnonymousUser();
+        } catch {
+          // Local/offline fallback
+          setCloudSyncState(prev => ({
+            ...prev,
+            status: 'offline-local',
+          }));
+        }
       }
     });
 
     return () => unsubAuth();
   }, []);
 
-  // Active Real-time Firestore Subscriptions for Lists, Friends, and Requests
+  // Active Real-time Firestore Subscriptions for Individual User Lists, Friends, and Requests
   useEffect(() => {
     if (!isFirebaseConfigured() || !cloudUser) return;
 
@@ -206,6 +218,36 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [cloudUser, user.email, user.phone]);
 
+  // Active Real-time Firestore Subscriptions for Family Room Lists
+  useEffect(() => {
+    if (!isFirebaseConfigured() || !user.familyCode) return;
+
+    const unsubFamily = subscribeToFamilyLists(
+      user.familyCode,
+      familyLists => {
+        if (familyLists.length > 0) {
+          setLists(prev => {
+            const currentFamilyCode = user.familyCode?.toUpperCase().trim();
+            const personal = prev.filter(l => l.familyCode !== currentFamilyCode);
+            const combined = [...familyLists, ...personal];
+            saveStorageLists(combined);
+            return combined;
+          });
+        }
+        setCloudSyncState(prevState => ({
+          ...prevState,
+          status: 'synced',
+          lastSyncedAt: new Date().toLocaleTimeString(),
+        }));
+      },
+      err => {
+        console.warn('[CloudSync] Family lists subscription error:', err);
+      }
+    );
+
+    return () => unsubFamily();
+  }, [user.familyCode]);
+
   const pendingRequestsCount = useMemo(
     () => friendRequests.filter(r => r.status === 'pending').length,
     [friendRequests]
@@ -239,6 +281,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
     }
 
+    const isShared = !!data.isShared;
+    const assignedFamilyCode =
+      isShared && user.familyCode ? user.familyCode.toUpperCase().trim() : undefined;
+
     const newList: GroceryList = {
       id: `list_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       title: data.title,
@@ -247,9 +293,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       icon: data.icon || 'cart',
       ownerId: currentUserId,
       ownerName: user.name,
-      isShared: !!data.isShared,
+      isShared,
       sharedWith: data.sharedWith || [],
       memberIds,
+      familyCode: assignedFamilyCode,
       items: [],
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -468,7 +515,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       senderName: user.name,
     });
 
-    // Also register pending outgoing request
     const newRequest: FriendRequest = {
       id: `req_${Date.now()}`,
       senderId: cloudUser ? cloudUser.uid : user.id,
@@ -550,7 +596,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       );
     }
 
-    // Also remove from any shared lists
     const updatedLists = lists.map(l => {
       const updatedShared = l.sharedWith.filter(f => f.id !== friendId);
       const updatedMembers = [l.ownerId, ...updatedShared.map(f => f.userId)];
@@ -587,6 +632,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           isShared: updatedShared.length > 0,
           sharedWith: updatedShared,
           memberIds: updatedMembers,
+          familyCode: updatedShared.length > 0 ? user.familyCode : undefined,
           updatedAt: new Date().toISOString(),
         };
         return modifiedList;
@@ -625,6 +671,58 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const signOutCloud = useCallback(async () => {
     await signOutCloudUser();
     setCloudUser(null);
+  }, []);
+
+  // Family Pairing Code Actions
+  const pairWithFamilyCode = useCallback(
+    async (code: string) => {
+      const normalized = code.toUpperCase().trim();
+      setUser(prev => {
+        const updated = { ...prev, familyCode: normalized };
+        saveStorageUser(updated);
+        return updated;
+      });
+      await saveStorageFamilyCode(normalized);
+
+      // Register family room on cloud
+      if (isFirebaseConfigured()) {
+        registerFamilyRoom(normalized, { id: user.id, name: user.name }).catch(() => {});
+      }
+
+      // Tag existing shared lists with this family code and sync
+      setLists(prev => {
+        const updatedLists = prev.map(l => {
+          if (l.isShared && !l.familyCode) {
+            const updated = { ...l, familyCode: normalized };
+            saveCloudList(updated).catch(() => {});
+            return updated;
+          }
+          return l;
+        });
+        saveStorageLists(updatedLists);
+        return updatedLists;
+      });
+
+      triggerHaptic('success');
+    },
+    [user.id, user.name]
+  );
+
+  const generateNewFamilyCode = useCallback(() => {
+    const prefixes = ['CART', 'MILK', 'SHOP', 'FOOD', 'HOME', 'PEAR', 'BREAD'];
+    const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
+    const num = Math.floor(100 + Math.random() * 900);
+    return `${prefix}-${num}`;
+  }, []);
+
+  const unpairFamily = useCallback(async () => {
+    setUser(prev => {
+      const updated = { ...prev, familyCode: undefined };
+      saveStorageUser(updated);
+      return updated;
+    });
+    await saveStorageFamilyCode(undefined);
+    triggerHaptic('light');
   }, []);
 
   // Simulated collaboration activity to demonstrate real-time sync when testing with family/partner
@@ -688,6 +786,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         isLoaded,
         cloudSyncState,
         cloudUser,
+        familyCode: user.familyCode,
         createList,
         updateList,
         deleteList,
@@ -706,6 +805,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         signUpWithEmail,
         signInAnonymously,
         signOutCloud,
+        pairWithFamilyCode,
+        generateNewFamilyCode,
+        unpairFamily,
       }}
     >
       {children}

@@ -25,6 +25,7 @@ export const prepareListForCloud = (list: GroceryList): GroceryList => {
   return {
     ...list,
     memberIds: Array.from(memberSet),
+    familyCode: list.familyCode ? list.familyCode.toUpperCase().trim() : undefined,
   };
 };
 
@@ -64,6 +65,65 @@ export const subscribeToCloudLists = (
     console.warn('[CloudSync] Failed to initialize lists listener:', err);
     return () => {};
   }
+};
+
+/**
+ * Real-time subscription to lists belonging to a shared family room
+ */
+export const subscribeToFamilyLists = (
+  familyCode: string,
+  onUpdate: (lists: GroceryList[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  if (!isFirebaseConfigured() || !db || !familyCode) {
+    return () => {};
+  }
+
+  try {
+    const listsCol = collection(db, 'lists');
+    const listsQuery = query(listsCol, where('familyCode', '==', familyCode.toUpperCase().trim()));
+
+    return onSnapshot(
+      listsQuery,
+      snapshot => {
+        const cloudLists: GroceryList[] = [];
+        snapshot.forEach(docSnap => {
+          cloudLists.push(docSnap.data() as GroceryList);
+        });
+        cloudLists.sort(
+          (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+        );
+        onUpdate(cloudLists);
+      },
+      error => {
+        console.warn('[CloudSync] Family lists subscription error:', error);
+        if (onError) onError(error);
+      }
+    );
+  } catch (err) {
+    console.warn('[CloudSync] Failed to initialize family lists listener:', err);
+    return () => {};
+  }
+};
+
+/**
+ * Register or join a family room in Firestore
+ */
+export const registerFamilyRoom = async (
+  familyCode: string,
+  user: { id: string; name: string }
+): Promise<void> => {
+  if (!isFirebaseConfigured() || !db) return;
+  const roomRef = doc(db, 'familyRooms', familyCode.toUpperCase().trim());
+  await setDoc(
+    roomRef,
+    {
+      code: familyCode.toUpperCase().trim(),
+      updatedAt: new Date().toISOString(),
+      lastMember: user.name,
+    },
+    { merge: true }
+  );
 };
 
 /**

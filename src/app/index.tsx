@@ -13,21 +13,36 @@ import { useApp } from '../context/AppContext';
 import { GroceryList } from '../types';
 import { CreateListModal } from '../components/CreateListModal';
 import { CloudSyncModal } from '../components/CloudSyncModal';
+import { FamilyPairingModal } from '../components/FamilyPairingModal';
 
 type FilterType = 'all' | 'shared' | 'personal';
 
 export default function HomeScreen() {
-  const { lists, pendingRequestsCount, cloudSyncState } = useApp();
+  const { lists, pendingRequestsCount, cloudSyncState, user } = useApp();
   const [filter, setFilter] = useState<FilterType>('all');
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showCloudModal, setShowCloudModal] = useState(false);
+  const [showPairingModal, setShowPairingModal] = useState(false);
   const navigation = useNavigation();
 
-  // Set up header right buttons with Cloud Sync status and pending friend request badge
+  // Set up header right buttons with Partner Pairing, Cloud Sync status and pending friend request badge
   React.useLayoutEffect(() => {
     navigation.setOptions({
       headerRight: () => (
         <View style={styles.headerRightContainer}>
+          <TouchableOpacity
+            onPress={() => setShowPairingModal(true)}
+            style={styles.pairingHeaderBtn}
+            activeOpacity={0.7}
+            accessibilityLabel="Partner pairing"
+          >
+            <Ionicons
+              name={user.familyCode ? 'heart' : 'link-outline'}
+              size={21}
+              color={user.familyCode ? '#ec4899' : '#0f172a'}
+            />
+          </TouchableOpacity>
+
           <TouchableOpacity
             onPress={() => setShowCloudModal(true)}
             style={styles.cloudHeaderBtn}
@@ -82,7 +97,7 @@ export default function HomeScreen() {
         </View>
       ),
     });
-  }, [navigation, pendingRequestsCount, cloudSyncState.status]);
+  }, [navigation, pendingRequestsCount, cloudSyncState.status, user.familyCode]);
 
   const filteredLists = lists.filter(l => {
     if (filter === 'shared') return l.isShared;
@@ -234,6 +249,39 @@ export default function HomeScreen() {
         </TouchableOpacity>
       </View>
 
+      {/* Partner & Family Sync Status Banner */}
+      <TouchableOpacity
+        style={[
+          styles.partnerCard,
+          user.familyCode ? styles.partnerCardPaired : styles.partnerCardUnpaired,
+        ]}
+        activeOpacity={0.8}
+        onPress={() => setShowPairingModal(true)}
+      >
+        <View style={styles.partnerCardLeft}>
+          <Ionicons
+            name={user.familyCode ? 'heart' : 'link-outline'}
+            size={20}
+            color={user.familyCode ? '#ec4899' : '#2563eb'}
+          />
+          <View style={styles.partnerCardTextContainer}>
+            <Text style={styles.partnerCardTitle}>
+              {user.familyCode ? `Paired with Partner (${user.familyCode})` : 'Pair with Partner'}
+            </Text>
+            <Text style={styles.partnerCardSubtitle}>
+              {user.familyCode
+                ? 'Lists and items sync automatically between devices'
+                : 'Connect with a 6-character code (No login required)'}
+            </Text>
+          </View>
+        </View>
+        <Ionicons
+          name="chevron-forward"
+          size={16}
+          color={user.familyCode ? '#16a34a' : '#64748b'}
+        />
+      </TouchableOpacity>
+
       {/* Lists Feed */}
       <FlatList
         data={filteredLists}
@@ -275,6 +323,12 @@ export default function HomeScreen() {
         visible={showCloudModal}
         onClose={() => setShowCloudModal(false)}
       />
+
+      {/* Family / Partner Pairing Code Modal */}
+      <FamilyPairingModal
+        visible={showPairingModal}
+        onClose={() => setShowPairingModal(false)}
+      />
     </SafeAreaView>
   );
 }
@@ -287,8 +341,51 @@ const styles = StyleSheet.create({
   headerRightContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 4,
+    gap: 2,
     marginRight: 4,
+  },
+  pairingHeaderBtn: {
+    padding: 8,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  partnerCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginHorizontal: 16,
+    marginBottom: 8,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+  },
+  partnerCardPaired: {
+    backgroundColor: '#fdf2f8',
+    borderColor: '#fbcfe8',
+  },
+  partnerCardUnpaired: {
+    backgroundColor: '#f0f9ff',
+    borderColor: '#bae6fd',
+  },
+  partnerCardLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    flex: 1,
+  },
+  partnerCardTextContainer: {
+    flex: 1,
+  },
+  partnerCardTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#0f172a',
+  },
+  partnerCardSubtitle: {
+    fontSize: 11,
+    color: '#64748b',
+    marginTop: 1,
   },
   cloudHeaderBtn: {
     padding: 8,
