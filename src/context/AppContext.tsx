@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState, useMemo, useCallback } from 'react';
+import React, { createContext, useContext, useEffect, useState, useMemo, useCallback, useRef } from 'react';
 import * as Haptics from 'expo-haptics';
 import {
   User,
@@ -8,6 +8,7 @@ import {
   GroceryItem,
   GroceryCategory,
   CloudSyncState,
+  FamilyRoom,
 } from '../types';
 import {
   DEFAULT_USER,
@@ -31,9 +32,18 @@ import {
 import {
   subscribeToCloudLists,
   subscribeToFamilyLists,
+  subscribeToCloudListItems,
+  subscribeToFamilyRoom,
   registerFamilyRoom,
+  joinFamilyRoom,
+  generateCollisionResistantFamilyCode,
+  normalizeFamilyCode,
   saveCloudList,
   deleteCloudList,
+  saveCloudItem,
+  updateCloudItemConcludeStatus,
+  deleteCloudItem,
+  batchDeleteCloudItems,
   subscribeToCloudFriendRequests,
   saveCloudFriendRequest,
   updateCloudFriendRequestStatus,
@@ -52,6 +62,7 @@ interface AppContextType {
   cloudSyncState: CloudSyncState;
   cloudUser: FirebaseUser | null;
   familyCode?: string;
+  familyRoom: FamilyRoom | null;
   createList: (data: {
     title: string;
     description?: string;
@@ -89,7 +100,8 @@ interface AppContextType {
   signUpWithEmail: (email: string, pass: string, name: string) => Promise<void>;
   signInAnonymously: () => Promise<void>;
   signOutCloud: () => Promise<void>;
-  pairWithFamilyCode: (code: string) => Promise<void>;
+  pairWithFamilyCode: (code: string) => Promise<FamilyRoom>;
+  createFamilyRoomWithCode: (code?: string) => Promise<FamilyRoom>;
   generateNewFamilyCode: () => string;
   unpairFamily: () => Promise<void>;
 }
@@ -101,6 +113,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [lists, setLists] = useState<GroceryList[]>([]);
   const [friends, setFriends] = useState<Friend[]>([]);
   const [friendRequests, setFriendRequests] = useState<FriendRequest[]>([]);
+  const [familyRoom, setFamilyRoom] = useState<FamilyRoom | null>(null);
   const [isLoaded, setIsLoaded] = useState(false);
 
   // Cloud Sync State
@@ -109,6 +122,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     isConfigured: isFirebaseConfigured(),
     status: isFirebaseConfigured() ? 'connecting' : 'offline-local',
   }));
+
+  // Track active real-time listeners for items in each list
+  const itemUnsubsRef = useRef<Map<string, () => void>>(new Map());
 
   // Load local persistent storage first (instant 0ms startup)
   useEffect(() => {
@@ -173,8 +189,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       cloudUser.uid,
       cloudLists => {
         if (cloudLists.length > 0) {
-          setLists(cloudLists);
-          saveStorageLists(cloudLists);
+          setLists(prev => {
+            // Merge cloud list metadata preserving local item states until subcollection updates
+            const map = new Map(prev.map(l => [l.id, l]));
+            const merged = cloudLists.map(cl => {
+              const local = map.get(cl.id);
+              return {
+                ...cl,
+                items: local && local.items && local.items.length > 0 ? local.items : (cl.items || []),
+              };
+            });
+            saveStorageLists(merged);
+            return merged;
+          });
         }
         setCloudSyncState(prev => ({
           ...prev,
@@ -218,18 +245,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [cloudUser, user.email, user.phone]);
 
-  // Active Real-time Firestore Subscriptions for Family Room Lists
+  // Active Real-time Firestore Subscriptions for Family Room Lists & Room Metadata
   useEffect(() => {
-    if (!isFirebaseConfigured() || !user.familyCode) return;
+    if (!isFirebaseConfigured() || !user.familyCode) {
+      return;
+    }
 
+    const currentFamilyCode = normalizeFamilyCode(user.familyCode);
+
+    // 1. Subscribe to room metadata (members, owner)
+    const unsubRoom = subscribeToFamilyRoom(currentFamilyCode, room => {
+      setFamilyRoom(room);
+    });
+
+    // 2. Subscribe to family lists
     const unsubFamily = subscribeToFamilyLists(
-      user.familyCode,
+      currentFamilyCode,
       familyLists => {
         if (familyLists.length > 0) {
           setLists(prev => {
-            const currentFamilyCode = user.familyCode?.toUpperCase().trim();
-            const personal = prev.filter(l => l.familyCode !== currentFamilyCode);
-            const combined = [...familyLists, ...personal];
+            const personal = prev.filter(
+              l => !l.familyCode || normalizeFamilyCode(l.familyCode) !== currentFamilyCode
+            );
+            const map = new Map(prev.map(l => [l.id, l]));
+            const mergedFamily = familyLists.map(fl => {
+              const local = map.get(fl.id);
+              return {
+                ...fl,
+                items: local && local.items && local.items.length > 0 ? local.items : (fl.items || []),
+              };
+            });
+            const combined = [...mergedFamily, ...personal];
             saveStorageLists(combined);
             return combined;
           });
@@ -245,8 +291,60 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
     );
 
-    return () => unsubFamily();
+    return () => {
+      unsubRoom();
+      unsubFamily();
+    };
   }, [user.familyCode]);
+
+  // Subcollection Real-time Listener per List:
+  // Dynamically attaches an item listener for each active list to prevent edit clobbering
+  useEffect(() => {
+    if (!isFirebaseConfigured()) return;
+
+    const currentListIds = new Set(lists.map(l => l.id));
+
+    // Cleanup listeners for lists that no longer exist
+    itemUnsubsRef.current.forEach((unsub, listId) => {
+      if (!currentListIds.has(listId)) {
+        unsub();
+        itemUnsubsRef.current.delete(listId);
+      }
+    });
+
+    // Attach listeners for newly added lists
+    lists.forEach(l => {
+      if (!itemUnsubsRef.current.has(l.id)) {
+        const unsub = subscribeToCloudListItems(l.id, cloudItems => {
+          setLists(prev => {
+            const next = prev.map(itemL => {
+              if (itemL.id === l.id) {
+                return {
+                  ...itemL,
+                  items: cloudItems,
+                  itemCount: cloudItems.length,
+                  concludedCount: cloudItems.filter(ci => ci.isConcluded).length,
+                };
+              }
+              return itemL;
+            });
+            saveStorageLists(next);
+            return next;
+          });
+        });
+        itemUnsubsRef.current.set(l.id, unsub);
+      }
+    });
+  }, [lists]);
+
+  // Cleanup all subcollection listeners on unmount
+  useEffect(() => {
+    const unsubs = itemUnsubsRef.current;
+    return () => {
+      unsubs.forEach(unsub => unsub());
+      unsubs.clear();
+    };
+  }, []);
 
   const pendingRequestsCount = useMemo(
     () => friendRequests.filter(r => r.status === 'pending').length,
@@ -283,7 +381,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     const isShared = !!data.isShared;
     const assignedFamilyCode =
-      isShared && user.familyCode ? user.familyCode.toUpperCase().trim() : undefined;
+      isShared && user.familyCode ? normalizeFamilyCode(user.familyCode) : undefined;
 
     const newList: GroceryList = {
       id: `list_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -298,6 +396,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       memberIds,
       familyCode: assignedFamilyCode,
       items: [],
+      itemCount: 0,
+      concludedCount: 0,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -329,6 +429,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const deleteList = (listId: string) => {
+    // Unsubscribe from items subcollection
+    if (itemUnsubsRef.current.has(listId)) {
+      itemUnsubsRef.current.get(listId)?.();
+      itemUnsubsRef.current.delete(listId);
+    }
+
     const updated = lists.filter(l => l.id !== listId);
     setLists(updated);
     saveStorageLists(updated);
@@ -363,16 +469,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       addedAt: new Date().toISOString(),
     };
 
-    let modifiedList: GroceryList | undefined;
-
+    // Optimistic local update
     const updated = lists.map(l => {
       if (l.id === listId) {
-        modifiedList = {
+        const nextItems = [newItem, ...l.items];
+        return {
           ...l,
           updatedAt: new Date().toISOString(),
-          items: [newItem, ...l.items],
+          items: nextItems,
+          itemCount: nextItems.length,
+          concludedCount: nextItems.filter(i => i.isConcluded).length,
         };
-        return modifiedList;
       }
       return l;
     });
@@ -381,24 +488,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     saveStorageLists(updated);
     triggerHaptic('light');
 
-    if (modifiedList) {
-      saveCloudList(modifiedList).catch(err =>
-        console.warn('[CloudSync] Failed to add item to cloud:', err)
-      );
-    }
+    // Isolated write to subcollection avoids edit clobbering
+    saveCloudItem(listId, newItem).catch(err =>
+      console.warn('[CloudSync] Failed to add item to cloud:', err)
+    );
   };
 
   const updateItem = (listId: string, updatedItem: GroceryItem) => {
-    let modifiedList: GroceryList | undefined;
-
     const updated = lists.map(l => {
       if (l.id === listId) {
-        modifiedList = {
+        const nextItems = l.items.map(it => (it.id === updatedItem.id ? updatedItem : it));
+        return {
           ...l,
           updatedAt: new Date().toISOString(),
-          items: l.items.map(it => (it.id === updatedItem.id ? updatedItem : it)),
+          items: nextItems,
+          itemCount: nextItems.length,
+          concludedCount: nextItems.filter(i => i.isConcluded).length,
         };
-        return modifiedList;
       }
       return l;
     });
@@ -406,24 +512,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setLists(updated);
     saveStorageLists(updated);
 
-    if (modifiedList) {
-      saveCloudList(modifiedList).catch(err =>
-        console.warn('[CloudSync] Failed to update item in cloud:', err)
-      );
-    }
+    saveCloudItem(listId, updatedItem).catch(err =>
+      console.warn('[CloudSync] Failed to update item in cloud:', err)
+    );
   };
 
   const deleteItem = (listId: string, itemId: string) => {
-    let modifiedList: GroceryList | undefined;
-
     const updated = lists.map(l => {
       if (l.id === listId) {
-        modifiedList = {
+        const nextItems = l.items.filter(it => it.id !== itemId);
+        return {
           ...l,
           updatedAt: new Date().toISOString(),
-          items: l.items.filter(it => it.id !== itemId),
+          items: nextItems,
+          itemCount: nextItems.length,
+          concludedCount: nextItems.filter(i => i.isConcluded).length,
         };
-        return modifiedList;
       }
       return l;
     });
@@ -432,16 +536,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     saveStorageLists(updated);
     triggerHaptic('light');
 
-    if (modifiedList) {
-      saveCloudList(modifiedList).catch(err =>
-        console.warn('[CloudSync] Failed to delete item from cloud:', err)
-      );
-    }
+    deleteCloudItem(listId, itemId).catch(err =>
+      console.warn('[CloudSync] Failed to delete item from cloud:', err)
+    );
   };
 
   const toggleConcludeItem = (listId: string, itemId: string) => {
     let nowConcluded = false;
-    let modifiedList: GroceryList | undefined;
 
     const updated = lists.map(l => {
       if (l.id === listId) {
@@ -458,12 +559,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           return it;
         });
 
-        modifiedList = {
+        return {
           ...l,
           updatedAt: new Date().toISOString(),
           items: updatedItems,
+          concludedCount: updatedItems.filter(i => i.isConcluded).length,
         };
-        return modifiedList;
       }
       return l;
     });
@@ -477,24 +578,34 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       triggerHaptic('light');
     }
 
-    if (modifiedList) {
-      saveCloudList(modifiedList).catch(err =>
-        console.warn('[CloudSync] Failed to toggle conclude item in cloud:', err)
-      );
-    }
+    // Atomic isolated update of conclude fields on single item document
+    updateCloudItemConcludeStatus(
+      listId,
+      itemId,
+      nowConcluded,
+      user.name.split(' ')[0],
+      new Date().toISOString()
+    ).catch(err =>
+      console.warn('[CloudSync] Failed to toggle conclude item in cloud:', err)
+    );
   };
 
   const clearConcludedItems = (listId: string) => {
-    let modifiedList: GroceryList | undefined;
+    const currentList = lists.find(l => l.id === listId);
+    const concludedItemIds = currentList
+      ? currentList.items.filter(it => it.isConcluded).map(it => it.id)
+      : [];
 
     const updated = lists.map(l => {
       if (l.id === listId) {
-        modifiedList = {
+        const activeItems = l.items.filter(it => !it.isConcluded);
+        return {
           ...l,
           updatedAt: new Date().toISOString(),
-          items: l.items.filter(it => !it.isConcluded),
+          items: activeItems,
+          itemCount: activeItems.length,
+          concludedCount: 0,
         };
-        return modifiedList;
       }
       return l;
     });
@@ -502,8 +613,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setLists(updated);
     saveStorageLists(updated);
 
-    if (modifiedList) {
-      saveCloudList(modifiedList).catch(err =>
+    if (concludedItemIds.length > 0) {
+      batchDeleteCloudItems(listId, concludedItemIds).catch(err =>
         console.warn('[CloudSync] Failed to clear concluded items in cloud:', err)
       );
     }
@@ -673,27 +784,32 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setCloudUser(null);
   }, []);
 
-  // Family Pairing Code Actions
-  const pairWithFamilyCode = useCallback(
-    async (code: string) => {
-      const normalized = code.toUpperCase().trim();
+  // Family Room & Pairing Code Actions
+  const createFamilyRoomWithCode = useCallback(
+    async (customCode?: string): Promise<FamilyRoom> => {
+      const currentUserId = cloudUser ? cloudUser.uid : user.id;
+      const codeToUse = customCode
+        ? normalizeFamilyCode(customCode)
+        : generateCollisionResistantFamilyCode();
+
+      const room = await registerFamilyRoom(codeToUse, {
+        id: currentUserId,
+        name: user.name,
+      });
+
       setUser(prev => {
-        const updated = { ...prev, familyCode: normalized };
+        const updated = { ...prev, familyCode: room.code };
         saveStorageUser(updated);
         return updated;
       });
-      await saveStorageFamilyCode(normalized);
+      await saveStorageFamilyCode(room.code);
+      setFamilyRoom(room);
 
-      // Register family room on cloud
-      if (isFirebaseConfigured()) {
-        registerFamilyRoom(normalized, { id: user.id, name: user.name }).catch(() => {});
-      }
-
-      // Tag existing shared lists with this family code and sync
+      // Tag existing shared lists with this family code
       setLists(prev => {
         const updatedLists = prev.map(l => {
           if (l.isShared && !l.familyCode) {
-            const updated = { ...l, familyCode: normalized };
+            const updated = { ...l, familyCode: room.code };
             saveCloudList(updated).catch(() => {});
             return updated;
           }
@@ -704,15 +820,52 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
 
       triggerHaptic('success');
+      return room;
     },
-    [user.id, user.name]
+    [cloudUser, user.id, user.name]
+  );
+
+  const pairWithFamilyCode = useCallback(
+    async (code: string): Promise<FamilyRoom> => {
+      const normalized = normalizeFamilyCode(code);
+      const currentUserId = cloudUser ? cloudUser.uid : user.id;
+
+      // Join room in Firestore with verification
+      const room = await joinFamilyRoom(normalized, {
+        id: currentUserId,
+        name: user.name,
+      });
+
+      setUser(prev => {
+        const updated = { ...prev, familyCode: room.code };
+        saveStorageUser(updated);
+        return updated;
+      });
+      await saveStorageFamilyCode(room.code);
+      setFamilyRoom(room);
+
+      // Tag existing shared lists with this family code
+      setLists(prev => {
+        const updatedLists = prev.map(l => {
+          if (l.isShared && !l.familyCode) {
+            const updated = { ...l, familyCode: room.code };
+            saveCloudList(updated).catch(() => {});
+            return updated;
+          }
+          return l;
+        });
+        saveStorageLists(updatedLists);
+        return updatedLists;
+      });
+
+      triggerHaptic('success');
+      return room;
+    },
+    [cloudUser, user.id, user.name]
   );
 
   const generateNewFamilyCode = useCallback(() => {
-    const prefixes = ['CART', 'MILK', 'SHOP', 'FOOD', 'HOME', 'PEAR', 'BREAD'];
-    const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
-    const num = Math.floor(100 + Math.random() * 900);
-    return `${prefix}-${num}`;
+    return generateCollisionResistantFamilyCode();
   }, []);
 
   const unpairFamily = useCallback(async () => {
@@ -721,11 +874,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       saveStorageUser(updated);
       return updated;
     });
+    setFamilyRoom(null);
     await saveStorageFamilyCode(undefined);
     triggerHaptic('light');
   }, []);
 
-  // Simulated collaboration activity to demonstrate real-time sync when testing with family/partner
+  // Simulated collaboration activity to demonstrate real-time sync
   const simulatePartnerActivity = (listId: string) => {
     const partnerItems = [
       { name: 'Avocados (3 pack)', category: 'Produce' as GroceryCategory, quantity: 1, unit: 'pack' },
@@ -750,16 +904,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       addedAt: new Date().toISOString(),
     };
 
-    let modifiedList: GroceryList | undefined;
-
     const updated = lists.map(l => {
       if (l.id === listId) {
-        modifiedList = {
+        const nextItems = [newItem, ...l.items];
+        return {
           ...l,
           updatedAt: new Date().toISOString(),
-          items: [newItem, ...l.items],
+          items: nextItems,
+          itemCount: nextItems.length,
+          concludedCount: nextItems.filter(i => i.isConcluded).length,
         };
-        return modifiedList;
       }
       return l;
     });
@@ -768,11 +922,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     saveStorageLists(updated);
     triggerHaptic('light');
 
-    if (modifiedList) {
-      saveCloudList(modifiedList).catch(err =>
-        console.warn('[CloudSync] Failed to simulate partner activity in cloud:', err)
-      );
-    }
+    saveCloudItem(listId, newItem).catch(err =>
+      console.warn('[CloudSync] Failed to simulate partner activity in cloud:', err)
+    );
   };
 
   return (
@@ -787,6 +939,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         cloudSyncState,
         cloudUser,
         familyCode: user.familyCode,
+        familyRoom,
         createList,
         updateList,
         deleteList,
@@ -806,6 +959,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         signInAnonymously,
         signOutCloud,
         pairWithFamilyCode,
+        createFamilyRoomWithCode,
         generateNewFamilyCode,
         unpairFamily,
       }}

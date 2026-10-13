@@ -59,6 +59,16 @@ export interface GroceryItem {
   notes?: string;
 }
 
+export interface FamilyRoom {
+  code: string;
+  ownerId: string;
+  ownerName: string;
+  memberIds: string[];
+  memberNames: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface GroceryList {
   id: string;
   title: string;
@@ -72,6 +82,8 @@ export interface GroceryList {
   memberIds?: string[];
   familyCode?: string;
   items: GroceryItem[];
+  itemCount?: number;
+  concludedCount?: number;
   createdAt: string;
   updatedAt: string;
 }

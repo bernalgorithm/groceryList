@@ -11,6 +11,7 @@ import {
   Platform,
   KeyboardAvoidingView,
   ScrollView,
+  ActivityIndicator,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useApp } from '../context/AppContext';
@@ -21,7 +22,14 @@ interface FamilyPairingModalProps {
 }
 
 export const FamilyPairingModal: React.FC<FamilyPairingModalProps> = ({ visible, onClose }) => {
-  const { user, pairWithFamilyCode, unpairFamily, generateNewFamilyCode } = useApp();
+  const {
+    user,
+    familyRoom,
+    pairWithFamilyCode,
+    createFamilyRoomWithCode,
+    unpairFamily,
+    generateNewFamilyCode,
+  } = useApp();
 
   const [inputCode, setInputCode] = useState('');
   const [copied, setCopied] = useState(false);
@@ -43,19 +51,23 @@ export const FamilyPairingModal: React.FC<FamilyPairingModalProps> = ({ visible,
   };
 
   const handleJoinCode = async () => {
-    const trimmed = inputCode.trim().toUpperCase();
+    const trimmed = inputCode.trim();
     if (!trimmed) {
       Alert.alert('Please enter a code', 'Type or paste the pairing code from your partner.');
       return;
     }
     setLoading(true);
     try {
-      await pairWithFamilyCode(trimmed);
+      const room = await pairWithFamilyCode(trimmed);
       setInputCode('');
-      Alert.alert('Connected!', `Your app is now linked to family room "${trimmed}". Lists will sync automatically.`);
+      Alert.alert(
+        'Connected!',
+        `Your app is now linked to family room "${room.code}". Lists and items will sync automatically with zero conflict.`
+      );
       onClose();
-    } catch {
-      Alert.alert('Error', 'Failed to connect. Please check the code and try again.');
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to connect. Please check the code and try again.';
+      Alert.alert('Pairing Error', message);
     } finally {
       setLoading(false);
     }
@@ -64,13 +76,22 @@ export const FamilyPairingModal: React.FC<FamilyPairingModalProps> = ({ visible,
   const handleActivateGeneratedCode = async () => {
     setLoading(true);
     try {
-      await pairWithFamilyCode(activeCode);
-      Alert.alert('Family Room Created!', `Your pairing code is ${activeCode}. Share this with your partner so they can join.`);
-    } catch {
-      Alert.alert('Error', 'Failed to activate code.');
+      const room = await createFamilyRoomWithCode(activeCode);
+      Alert.alert(
+        'Family Room Active!',
+        `Your pairing code is ${room.code}. Share this with your partner so they can join.`
+      );
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to activate code.';
+      Alert.alert('Error', message);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleRegenerateCode = () => {
+    const next = generateNewFamilyCode();
+    setGeneratedCode(next);
   };
 
   const handleUnpair = () => {
@@ -120,13 +141,30 @@ export const FamilyPairingModal: React.FC<FamilyPairingModalProps> = ({ visible,
                   </View>
                   <Text style={styles.pairedTitle}>Paired with Partner</Text>
                   <Text style={styles.pairedSubtitle}>
-                    All your shared lists and checked items synchronize automatically over the cloud.
+                    All your shared lists and items synchronize automatically in real time with collision-free item sync.
                   </Text>
 
                   <View style={styles.codeCard}>
-                    <Text style={styles.codeLabel}>YOUR FAMILY CODE</Text>
+                    <Text style={styles.codeLabel}>YOUR FAMILY ROOM CODE</Text>
                     <Text style={styles.codeValue}>{user.familyCode}</Text>
                   </View>
+
+                  {/* Connected Members */}
+                  {familyRoom?.memberNames && familyRoom.memberNames.length > 0 && (
+                    <View style={styles.membersContainer}>
+                      <Text style={styles.membersTitle}>
+                        CONNECTED MEMBERS ({familyRoom.memberNames.length})
+                      </Text>
+                      <View style={styles.membersRow}>
+                        {familyRoom.memberNames.map((name, idx) => (
+                          <View key={idx} style={styles.memberBadge}>
+                            <Ionicons name="person" size={12} color="#16a34a" />
+                            <Text style={styles.memberName}>{name}</Text>
+                          </View>
+                        ))}
+                      </View>
+                    </View>
+                  )}
 
                   <TouchableOpacity style={styles.shareBtn} onPress={handleCopyCode}>
                     <Ionicons name="share-social-outline" size={18} color="#ffffff" />
@@ -145,14 +183,19 @@ export const FamilyPairingModal: React.FC<FamilyPairingModalProps> = ({ visible,
               /* NOT PAIRED YET - OPTION TO CREATE OR JOIN */
               <View>
                 <Text style={styles.introText}>
-                  Sync grocery lists between you and your partner over the internet with zero logins, emails, or passwords.
+                  Sync grocery lists between you and your partner over the cloud. Safe for thousands of users with zero login friction.
                 </Text>
 
                 {/* Section A: Share your code */}
                 <View style={styles.card}>
-                  <Text style={styles.sectionHeader}>OPTION 1: SHARE YOUR CODE</Text>
+                  <View style={styles.sectionHeaderRow}>
+                    <Text style={styles.sectionHeader}>OPTION 1: SHARE YOUR CODE</Text>
+                    <TouchableOpacity onPress={handleRegenerateCode} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                      <Ionicons name="refresh" size={16} color="#64748b" />
+                    </TouchableOpacity>
+                  </View>
                   <Text style={styles.cardDesc}>
-                    Give this pairing code to your partner to enter on their phone:
+                    Give this collision-resistant pairing code to your partner to enter on their phone:
                   </Text>
 
                   <View style={styles.codeBox}>
@@ -165,8 +208,14 @@ export const FamilyPairingModal: React.FC<FamilyPairingModalProps> = ({ visible,
                       onPress={handleActivateGeneratedCode}
                       disabled={loading}
                     >
-                      <Ionicons name="key" size={16} color="#ffffff" />
-                      <Text style={styles.primaryBtnText}>Use This Code</Text>
+                      {loading ? (
+                        <ActivityIndicator size="small" color="#ffffff" />
+                      ) : (
+                        <>
+                          <Ionicons name="key" size={16} color="#ffffff" />
+                          <Text style={styles.primaryBtnText}>Activate This Room</Text>
+                        </>
+                      )}
                     </TouchableOpacity>
 
                     <TouchableOpacity style={styles.secondaryBtn} onPress={handleCopyCode}>
@@ -184,7 +233,7 @@ export const FamilyPairingModal: React.FC<FamilyPairingModalProps> = ({ visible,
 
                   <TextInput
                     style={styles.input}
-                    placeholder="e.g. MILK-482"
+                    placeholder="e.g. K9P-4X2"
                     placeholderTextColor="#94a3b8"
                     value={inputCode}
                     onChangeText={setInputCode}
@@ -197,8 +246,14 @@ export const FamilyPairingModal: React.FC<FamilyPairingModalProps> = ({ visible,
                     onPress={handleJoinCode}
                     disabled={loading}
                   >
-                    <Ionicons name="link" size={18} color="#ffffff" />
-                    <Text style={styles.connectBtnText}>Connect to Partner</Text>
+                    {loading ? (
+                      <ActivityIndicator size="small" color="#ffffff" />
+                    ) : (
+                      <>
+                        <Ionicons name="link" size={18} color="#ffffff" />
+                        <Text style={styles.connectBtnText}>Connect to Partner</Text>
+                      </>
+                    )}
                   </TouchableOpacity>
                 </View>
               </View>
@@ -263,12 +318,17 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#e2e8f0',
   },
+  sectionHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
   sectionHeader: {
     fontSize: 11,
     fontWeight: '800',
     color: '#64748b',
     letterSpacing: 0.5,
-    marginBottom: 6,
   },
   cardDesc: {
     fontSize: 13,
@@ -379,7 +439,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     borderWidth: 1,
     borderColor: '#bbf7d0',
-    marginBottom: 16,
+    marginBottom: 14,
   },
   codeLabel: {
     fontSize: 10,
@@ -393,6 +453,45 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     color: '#0f172a',
     letterSpacing: 2,
+  },
+  membersContainer: {
+    width: '100%',
+    backgroundColor: '#ffffff',
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    marginBottom: 16,
+    alignItems: 'center',
+  },
+  membersTitle: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: '#64748b',
+    letterSpacing: 0.5,
+    marginBottom: 8,
+  },
+  membersRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    justifyContent: 'center',
+  },
+  memberBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: '#ecfdf5',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#a7f3d0',
+  },
+  memberName: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#065f46',
   },
   shareBtn: {
     flexDirection: 'row',
